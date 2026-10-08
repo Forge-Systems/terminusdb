@@ -368,22 +368,28 @@ check_stuck_workers :-
 %%  will fail with EPIPE, and we signal the thread to abort.
 check_pipe_health :-
     (   active_pipe(OutputWriteFd, ThreadId, Alias),
-        catch(thread_property(ThreadId, status(Status)), _, Status = not_found),
+        with_mutex(pipe_health,
+                   check_pipe_health_entry(OutputWriteFd, ThreadId, Alias)),
+        fail
+    ;   true
+    ).
+
+check_pipe_health_entry(OutputWriteFd, ThreadId, Alias) :-
+    (   active_pipe(OutputWriteFd, ThreadId, Alias)
+    ->  catch(thread_property(ThreadId, status(Status)), _, Status = not_found),
         (   Status == running
         ->  (   pipe_write_health_check(OutputWriteFd)
-            ->  true  %% pipe is healthy
+            ->  true
             ;   json_log_error_formatted(
                     "Watchdog: pipe FD ~w (worker ~w, thread ~w) write check failed — signalling client_disconnected",
                     [OutputWriteFd, Alias, ThreadId]),
                 cancel_pipe_request(OutputWriteFd)
             )
-        ;   %% Thread is dead — remove stale entry
-            json_log_error_formatted(
+        ;   json_log_error_formatted(
                 "Watchdog: removing stale active_pipe entry for FD ~w (thread ~w is dead: ~w)",
                 [OutputWriteFd, ThreadId, Status]),
             unregister_active_pipe(OutputWriteFd)
-        ),
-        fail
+        )
     ;   true
     ).
 
@@ -697,7 +703,8 @@ handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd
                 )
             )
         ),
-        (   catch(close(OutStream), _, true),
+        (   with_mutex(pipe_health, unregister_active_pipe(OutputWriteFd)),
+            catch(close(OutStream), _, true),
             (   InputReadFd >= 0 -> catch(close(InStream), _, true) ; true ),
             catch(close(BodyStream), _, true),
             catch(free_memory_file(MemoryFile), _, true),
@@ -705,8 +712,7 @@ handle_pipe_work(Request, HandlerModule, HandlerName, InputReadFd, OutputWriteFd
             %% underlying FD if flushing buffered data encounters an error
             %% (e.g. broken pipe). Explicitly close the FDs to prevent leaks.
             catch('$appserver':appserver_close_fd(OutputWriteFd), _, true),
-            (   InputReadFd >= 0 -> catch('$appserver':appserver_close_fd(InputReadFd), _, true) ; true ),
-            unregister_active_pipe(OutputWriteFd)
+            (   InputReadFd >= 0 -> catch('$appserver':appserver_close_fd(InputReadFd), _, true) ; true )
         )
     ).
 
